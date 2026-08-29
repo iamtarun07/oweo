@@ -34,9 +34,8 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  sessions           Session[]
-  verificationTokens EmailVerificationToken[]
-  passwordResetOtps  PasswordResetOtp[]
+  sessions          Session[]
+  passwordResetOtps PasswordResetOtp[]
 }
 
 /// One row per refresh token. Rotating a token adds a row; it never edits one.
@@ -66,18 +65,28 @@ model Session {
   @@index([expiresAt])
 }
 
-/// Single-use link token emailed after registration. Valid 24h (BR-AUTH-5).
-model EmailVerificationToken {
-  id     String @id @default(uuid())
-  userId String
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+/// A signup waiting on its 6-digit email code. There is no User row yet — one is
+/// inserted only when the code is confirmed, so an abandoned signup leaves
+/// nothing behind and never claims the address.
+model PendingSignup {
+  id String @id @default(uuid())
 
-  tokenHash  String    @unique
-  expiresAt  DateTime
-  consumedAt DateTime? // null = still usable
-  createdAt  DateTime  @default(now())
+  // No relation and no @unique: there is no User to point at, and several
+  // attempts for one address are normal. Lookups take the newest unconsumed row.
+  email        String
+  firstName    String
+  lastName     String
+  passwordHash String
 
-  @@index([userId])
+  // Same shape as PasswordResetOtp, for the same reason: a million codes exist,
+  // so two rows sharing a hash is expected and the column cannot be unique.
+  otpHash      String
+  expiresAt    DateTime
+  attemptCount Int       @default(0)
+  consumedAt   DateTime? // null = still usable
+  createdAt    DateTime  @default(now())
+
+  @@index([email])
 }
 
 /// 6-digit password-reset code. Valid 10 minutes, 5 guesses.

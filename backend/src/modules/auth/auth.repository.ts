@@ -1,5 +1,5 @@
 import { Prisma } from "../../generated/prisma/client";
-import type { EmailVerificationToken, PasswordResetOtp, Session, User } from "../../generated/prisma/client";
+import type { PasswordResetOtp, PendingSignup, Session, User } from "../../generated/prisma/client";
 import { prisma } from "../../infrastructure/database/prisma";
 import { generateFriendCode } from "../../shared/crypto/friendCode";
 
@@ -33,7 +33,13 @@ export function findUserById(id: string, db: Db = prisma): Promise<User | null> 
  * never runs — it is correctness insurance, not a hot path.
  */
 export async function createUser(
-  data: { email: string; passwordHash: string; firstName: string; lastName: string },
+  data: {
+    email: string;
+    passwordHash: string;
+    firstName: string;
+    lastName: string;
+    emailVerifiedAt?: Date;
+  },
   db: Db = prisma
 ): Promise<User> {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -122,40 +128,58 @@ export function revokeAllUserSessions(userId: string, db: Db = prisma) {
   });
 }
 
-// --- Email verification tokens --------------------------------------------
+// --- Pending signups (email verification OTP) ------------------------------
 
-export function findVerificationToken(
-  tokenHash: string,
+/**
+ * BR-AUTH-7: issuing a new code must invalidate the older ones.
+ * Rows are marked consumed rather than deleted, so the signup funnel stays
+ * measurable (PRD §32) and there is an audit trail.
+ *
+ * Everything the account will need is carried on the row, because the User does
+ * not exist yet - the row IS the signup until the code is confirmed.
+ */
+export async function issuePendingSignup(
+  data: {
+    email: string;
+    firstName: string;
+    lastName: string;
+    passwordHash: string;
+    otpHash: string;
+    expiresAt: Date;
+  },
   db: Db = prisma
-): Promise<EmailVerificationToken | null> {
-  return db.emailVerificationToken.findUnique({ where: { tokenHash } });
+): Promise<PendingSignup> {
+  await db.pendingSignup.updateMany({
+    where: { email: data.email, consumedAt: null },
+    data: { consumedAt: new Date() },
+  });
+  return db.pendingSignup.create({ data });
 }
 
 /**
- * BR-AUTH-7: issuing a new token must invalidate the older ones.
- * We mark them consumed rather than deleting them, so the verification funnel
- * stays measurable (PRD §32) and there is an audit trail.
+ * The newest unused signup FOR THIS EMAIL.
+ * Scoping by email is mandatory for the same reason the reset lookup scopes by
+ * userId: a global "does any row hold this hash?" search would let one person's
+ * code confirm somebody else's signup.
  */
-export async function issueVerificationToken(
-  userId: string,
-  tokenHash: string,
-  expiresAt: Date,
-  db: Db = prisma
-): Promise<EmailVerificationToken> {
-  await db.emailVerificationToken.updateMany({
-    where: { userId, consumedAt: null },
-    data: { consumedAt: new Date() },
+export function findLatestPendingSignup(email: string, db: Db = prisma): Promise<PendingSignup | null> {
+  return db.pendingSignup.findFirst({
+    where: { email, consumedAt: null },
+    orderBy: { createdAt: "desc" },
   });
-  return db.emailVerificationToken.create({ data: { userId, tokenHash, expiresAt } });
 }
 
-/** How many verification emails this user asked for since `since` (rate limit). */
-export function countVerificationTokensSince(userId: string, since: Date, db: Db = prisma): Promise<number> {
-  return db.emailVerificationToken.count({ where: { userId, createdAt: { gte: since } } });
+/** How many codes this address has been sent since `since` (rate limit). */
+export function countPendingSignupsSince(email: string, since: Date, db: Db = prisma): Promise<number> {
+  return db.pendingSignup.count({ where: { email, createdAt: { gte: since } } });
 }
 
-export function consumeVerificationToken(id: string, db: Db = prisma) {
-  return db.emailVerificationToken.update({ where: { id }, data: { consumedAt: new Date() } });
+export function incrementPendingSignupAttempts(id: string, db: Db = prisma) {
+  return db.pendingSignup.update({ where: { id }, data: { attemptCount: { increment: 1 } } });
+}
+
+export function consumePendingSignup(id: string, db: Db = prisma) {
+  return db.pendingSignup.update({ where: { id }, data: { consumedAt: new Date() } });
 }
 
 // --- Password reset OTPs ---------------------------------------------------

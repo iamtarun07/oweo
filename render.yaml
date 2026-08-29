@@ -1,0 +1,39 @@
+# Render Blueprint. Creates the API service; Postgres lives on Neon.
+services:
+  - type: web
+    name: oweo-api
+    runtime: node
+    plan: free
+    region: singapore
+    rootDir: backend
+    # --include=dev: typescript + prisma CLI are devDependencies and are needed
+    # by the build and by `prisma migrate deploy` at start.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npx prisma migrate deploy && npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Neon connection string. Use the DIRECT (unpooled) URL — Prisma
+      # migrations do not work reliably through the PgBouncer pooler.
+      - key: DATABASE_URL
+        sync: false
+      - key: ACCESS_TOKEN_SECRET
+        generateValue: true
+      - key: REFRESH_TOKEN_SECRET
+        generateValue: true
+      - key: ACCESS_TOKEN_TTL
+        value: 15m
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: 30
+      # Set to the service's own https URL once Render has assigned it.
+      - key: APP_BASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: MAIL_DRIVER
+        value: console
+      - key: MAIL_FROM
+        value: Oweo <onboarding@resend.dev>
+      - key: LOG_LEVEL
+        value: info

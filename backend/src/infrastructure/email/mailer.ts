@@ -46,34 +46,47 @@ function layout(heading: string, bodyHtml: string): string {
 </div>`.trim();
 }
 
-export function verificationEmail(to: string, token: string): EmailMessage {
-  const link = `${env.APP_BASE_URL}/verify-email?token=${token}`;
-
+/**
+ * The code shown on the signup flow's second screen.
+ *
+ * A code, not a link, because the person is already sitting in the app waiting
+ * on a six-box input - a link would send them to a browser and strand the
+ * screen that is asking the question. It also means the code never leaves the
+ * device that started the signup, which a forwarded link cannot promise.
+ *
+ * Putting the code in the SUBJECT is deliberate: most clients show the subject
+ * in the notification, so the code is readable without opening the mail.
+ */
+export function verificationEmail(to: string, otp: string): EmailMessage {
   return {
     to,
-    subject: "Verify your Oweo email",
+    subject: `${otp} is your Oweo verification code`,
     text: [
       "Welcome to Oweo!",
       "",
-      "Confirm your email address by opening this link:",
-      link,
+      `Your verification code is: ${otp}`,
       "",
-      "The link works for 24 hours and can be used once.",
-      "If you did not sign up, ignore this email.",
+      "Enter it on the signup screen to finish creating your account.",
+      "",
+      "The code expires in 5 minutes, works once, and allows 5 attempts.",
+      "If you did not sign up, ignore this email - no account has been created.",
     ].join("\n"),
     html: layout(
       "Confirm your email address",
-      `<p style="margin:0 0 24px;font-size:14px;line-height:22px;color:#374151;">
-         Tap the button to finish setting up your account.
+      `<p style="margin:0 0 20px;font-size:14px;line-height:22px;color:#374151;">
+         Enter this code on the signup screen to finish creating your account.
        </p>
-       <a href="${link}" style="display:inline-block;padding:12px 24px;background:#111827;color:#ffffff;
-          text-decoration:none;border-radius:8px;font-size:14px;font-weight:600;">Verify email</a>
-       <p style="margin:24px 0 0;font-size:12px;line-height:18px;color:#6b7280;">
-         Button not working? Paste this into your browser:<br>
-         <span style="word-break:break-all;color:#374151;">${link}</span>
+       <p style="margin:0 0 20px;padding:16px;background:#f3f4f6;border-radius:8px;text-align:center;
+          font-family:Consolas,Menlo,monospace;font-size:32px;font-weight:700;letter-spacing:8px;color:#111827;">
+         ${otp}
        </p>
-       <p style="margin:16px 0 0;font-size:12px;color:#6b7280;">
-         This link works for 24 hours and can be used once.
+       <p style="margin:0;font-size:13px;line-height:20px;color:#6b7280;">
+         Expires in <strong style="color:#374151;">5 minutes</strong> &middot;
+         can be used <strong style="color:#374151;">once</strong> &middot;
+         <strong style="color:#374151;">5 attempts</strong> allowed
+       </p>
+       <p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#6b7280;">
+         Did not sign up? Ignore this email - no account has been created.
        </p>`
     ),
   };
@@ -86,7 +99,7 @@ export function verificationEmail(to: string, token: string): EmailMessage {
  *
  * So the email says "go back to the app", never "click here": there is nothing
  * to click, and a link would only confuse someone already on screen 2.
- * The three limits (10 minutes, one use, five tries) are spelled out because a
+ * The three limits (5 minutes, one use, five tries) are spelled out because a
  * user who knows them will not sit on a dead code retyping it.
  */
 export function passwordResetEmail(to: string, otp: string): EmailMessage {
@@ -98,7 +111,7 @@ export function passwordResetEmail(to: string, otp: string): EmailMessage {
       "",
       "Enter it on the reset screen together with your new password.",
       "",
-      "The code expires in 10 minutes, works once, and allows 5 attempts.",
+      "The code expires in 5 minutes, works once, and allows 5 attempts.",
       "If you did not ask to reset your password, ignore this email - nothing has changed.",
     ].join("\n"),
     html: layout(
@@ -111,7 +124,7 @@ export function passwordResetEmail(to: string, otp: string): EmailMessage {
          ${otp}
        </p>
        <p style="margin:0;font-size:13px;line-height:20px;color:#6b7280;">
-         Expires in <strong style="color:#374151;">10 minutes</strong> &middot;
+         Expires in <strong style="color:#374151;">5 minutes</strong> &middot;
          can be used <strong style="color:#374151;">once</strong> &middot;
          <strong style="color:#374151;">5 attempts</strong> allowed
        </p>

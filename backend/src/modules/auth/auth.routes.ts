@@ -9,6 +9,7 @@ import {
   logoutSchema,
   refreshSchema,
   registerSchema,
+  resendVerificationSchema,
   resetPasswordSchema,
   verifyEmailSchema,
 } from "./auth.schemas";
@@ -33,10 +34,10 @@ router.post("/refresh", validate(refreshSchema), controller.refresh);
 
 router.post("/logout", requireAuth, validate(logoutSchema), controller.logout);
 
-// No requireAuth: the verification link may be opened while signed out,
-// on a different device (PRD EC-A12).
+// Neither of these can require a Bearer token: the caller has no account yet.
+// /verify-email is what creates it, and it is the endpoint that returns tokens.
 router.post("/verify-email", validate(verifyEmailSchema), controller.verifyEmail);
-router.post("/verify-email/resend", requireAuth, controller.resendVerification);
+router.post("/verify-email/resend", validate(resendVerificationSchema), controller.resendVerification);
 
 router.post("/forgot-password", validate(forgotPasswordSchema), controller.forgotPassword);
 router.post("/reset-password", validate(resetPasswordSchema), controller.resetPassword);

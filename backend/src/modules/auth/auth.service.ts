@@ -12,7 +12,7 @@ import { DUMMY_PASSWORD_HASH_PROMISE, hashPassword, verifyPassword } from "../..
 import { generateNumericOtp, generateOpaqueToken, hashToken } from "../../shared/crypto/tokens";
 import { DAY_MS, HOUR_MS, MINUTE_MS, durationToSeconds, fromNow, minutesUntil } from "../../shared/utils/time";
 import * as repo from "./auth.repository";
-import type { LoginInput, RegisterInput, ResetPasswordInput } from "./auth.schemas";
+import type { LoginInput, RegisterInput, ResetPasswordInput, VerifyEmailInput } from "./auth.schemas";
 import { AuthPayload, toPublicUser } from "./auth.types";
 
 // ponytail: per-account lockout only. Per-origin limiting (PRD 29.5, SEC-29)
@@ -20,12 +20,17 @@ import { AuthPayload, toPublicUser } from "./auth.types";
 
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOCK_DURATION_MS = 15 * MINUTE_MS;
-const VERIFICATION_TTL_MS = 24 * HOUR_MS; // BR-AUTH-5
-const OTP_TTL_MS = 10 * MINUTE_MS;
+// One TTL for both codes. A six-digit code is only a million combinations, so a
+// 24-hour window (which the old emailed LINK could afford) would be reckless.
+// Five minutes, not ten: the screens state "Valid for 5 minutes" as fact.
+const OTP_TTL_MS = 5 * MINUTE_MS;
 const MAX_OTP_ATTEMPTS = 5;
 
 /** Same wording for every branch of /forgot-password. See sendPasswordResetOtp. */
 export const NEUTRAL_RESET_MESSAGE = "If an account exists for this email, we've sent a code.";
+
+/** Same wording for every branch of /verify-email/resend. See resendVerificationOtp. */
+export const NEUTRAL_VERIFICATION_MESSAGE = "If a signup is waiting for this email, we've sent a new code.";
 
 // --- Tokens ----------------------------------------------------------------
 
@@ -73,50 +78,74 @@ function sendEmailInBackground(send: Promise<void>, context: string) {
 
 // --- Step 13: register -----------------------------------------------------
 
-export async function register(input: RegisterInput, userAgent?: string): Promise<AuthPayload> {
+/**
+ * Issue a signup code, subject to BR-AUTH-6: at most 1 per minute and 5 per day
+ * for one address. The rows already carry createdAt, so counting them is the
+ * whole rate limiter - no Redis needed.
+ *
+ * `onLimit` differs by caller: register tells the user to wait (they are staring
+ * at the screen and deserve an answer), resend stays silent (it is a public
+ * endpoint, and a 429 there would reveal that a signup exists for this address).
+ */
+async function issueSignupOtp(
+  data: { email: string; firstName: string; lastName: string; passwordHash: string },
+  context: string,
+  onLimit: (message: string) => void
+): Promise<void> {
+  const now = new Date();
+
+  const lastMinute = await repo.countPendingSignupsSince(data.email, new Date(now.getTime() - MINUTE_MS));
+  if (lastMinute > 0) return onLimit("Please wait a minute before requesting another code.");
+
+  const lastDay = await repo.countPendingSignupsSince(data.email, new Date(now.getTime() - DAY_MS));
+  if (lastDay >= 5) return onLimit("Too many requests today. Please try again tomorrow.");
+
+  const otp = generateNumericOtp();
+  await repo.issuePendingSignup({
+    ...data,
+    otpHash: hashToken(otp),
+    expiresAt: fromNow(OTP_TTL_MS, now),
+  });
+
+  // Never awaited: a slow or broken mail provider must not decide how long the
+  // API takes to answer (PRD FR-AUTH-06 / AC-A3).
+  sendEmailInBackground(mailer.send(verificationEmail(data.email, otp)), context);
+}
+
+/**
+ * Step one of two. NOTHING is created in `User` here - only a PendingSignup row
+ * holding the hashed password and the hashed code. The account itself is
+ * inserted in verifyEmail, so abandoning the signup leaves no junk row and
+ * never claims the address.
+ *
+ * The trade that comes with it: an unverified address is not reserved, so two
+ * people can hold a pending signup for the same email at once. Whoever confirms
+ * their code first gets the account; the other gets EMAIL_ALREADY_EXISTS at
+ * verify time, decided by the unique index rather than by a check that could race.
+ */
+export async function register(input: RegisterInput): Promise<{ email: string }> {
   // Hashing FIRST, before we know whether the email is taken. If we returned
-  // early on a duplicate, that path would answer in ~5ms while a new account
+  // early on a duplicate, that path would answer in ~5ms while a new signup
   // takes ~200ms, and the difference alone tells an attacker which emails are
   // registered (PRD SEC-4).
   const passwordHash = await hashPassword(input.password);
 
-  const verificationToken = generateOpaqueToken();
-
-  let user: User;
-  try {
-    // One transaction: either the user AND their verification token exist, or
-    // neither does. No half-created accounts.
-    user = await prisma.$transaction(async (tx) => {
-      const created = await repo.createUser(
-        { email: input.email, passwordHash, firstName: input.firstName, lastName: input.lastName },
-        tx
-      );
-      await repo.issueVerificationToken(
-        created.id,
-        hashToken(verificationToken),
-        fromNow(VERIFICATION_TTL_MS),
-        tx
-      );
-      return created;
-    });
-  } catch (err) {
-    // We never SELECT to check the email first - two simultaneous signups would
-    // both pass that check (PRD EC-A1). The unique index is the only atomic
-    // judge, so we insert and translate its complaint.
-    if (repo.isUniqueViolation(err, "email")) {
-      throw AppError.conflict(ErrorCodes.EMAIL_ALREADY_EXISTS, "An account with this email already exists.");
-    }
-    throw err;
+  // Only a courtesy: with no INSERT into User here there is no unique index to
+  // arbitrate yet, so this lookup cannot be the real defence and is not treated
+  // as one. verifyEmail holds the authoritative check.
+  if (await repo.findUserByEmail(input.email)) {
+    throw AppError.conflict(ErrorCodes.EMAIL_ALREADY_EXISTS, "An account with this email already exists.");
   }
 
-  const refreshToken = await startSession(user.id, userAgent);
+  await issueSignupOtp(
+    { email: input.email, firstName: input.firstName, lastName: input.lastName, passwordHash },
+    "verification",
+    (message) => {
+      throw AppError.rateLimited(message);
+    }
+  );
 
-  // Outside the transaction on purpose: mail inside it would hold a database
-  // connection open for the provider's round trip, and a mail failure would
-  // roll back a perfectly good account.
-  sendEmailInBackground(mailer.send(verificationEmail(user.email, verificationToken)), "verification");
-
-  return authPayload(user, refreshToken);
+  return { email: input.email };
 }
 
 // --- Step 14: login --------------------------------------------------------
@@ -234,46 +263,102 @@ export async function logout(userId: string, token: string): Promise<void> {
 
 // --- Step 18: verify email -------------------------------------------------
 
-export async function verifyEmail(token: string): Promise<void> {
-  const row = await repo.findVerificationToken(hashToken(token));
-  if (!row) throw AppError.tokenInvalid("This verification link is not valid.");
+/**
+ * Step two of two, and the moment the account actually exists. The code checks
+ * below are the same three limits that make six digits safe - five guesses, ten
+ * minutes, and one use - because a million combinations is nothing without them.
+ *
+ * Deliberately NOT idempotent. Confirming the code consumes the row, so calling
+ * this twice fails with OTP_INVALID. The tempting alternative - "the address is
+ * already verified, so hand back tokens" - would sign anyone in who knows an
+ * email address and no code at all.
+ */
+export async function verifyEmail(input: VerifyEmailInput, userAgent?: string): Promise<AuthPayload> {
+  const pending = await repo.findLatestPendingSignup(input.email);
+  // Same error as a wrong code: whether a signup is waiting for this address is
+  // not something this endpoint should confirm.
+  if (!pending) throw new AppError(400, ErrorCodes.OTP_INVALID, "That code is not valid.");
 
-  if (row.consumedAt) {
-    const user = await repo.findUserById(row.userId);
-    // Already used AND already verified: the user's goal is achieved, so
-    // showing an error would be confusing and pointless (PRD AC-A12).
-    if (user?.emailVerifiedAt) return;
-    throw AppError.tokenInvalid("This verification link has already been used.");
+  if (pending.attemptCount >= MAX_OTP_ATTEMPTS) {
+    await repo.consumePendingSignup(pending.id);
+    throw new AppError(400, ErrorCodes.OTP_ATTEMPTS_EXCEEDED, "Too many wrong codes. Request a new one.");
   }
 
-  if (row.expiresAt <= new Date()) {
-    throw AppError.tokenExpired("This link has expired. Request a new one.");
+  if (pending.expiresAt <= new Date()) {
+    throw new AppError(400, ErrorCodes.OTP_EXPIRED, "That code has expired. Request a new one.");
   }
 
-  await prisma.$transaction(async (tx) => {
-    await repo.consumeVerificationToken(row.id, tx);
-    await repo.updateUser(row.userId, { emailVerifiedAt: new Date() }, tx);
-  });
+  if (hashToken(input.otp) !== pending.otpHash) {
+    // Counting the wrong guesses IS the brute-force defence. Six digits is only
+    // a million combinations; without this counter a script cracks it in minutes.
+    await repo.incrementPendingSignupAttempts(pending.id);
+    throw new AppError(400, ErrorCodes.OTP_INVALID, "That code is not valid.");
+  }
+
+  let user: User;
+  try {
+    // One transaction: either the account exists AND the code is spent, or
+    // neither happened. A code that survived a failed insert could be replayed.
+    user = await prisma.$transaction(async (tx) => {
+      const created = await repo.createUser(
+        {
+          email: pending.email,
+          passwordHash: pending.passwordHash,
+          firstName: pending.firstName,
+          lastName: pending.lastName,
+          // Verified at birth: the code just proved the address. There is no
+          // window in which a User row exists with this left null.
+          emailVerifiedAt: new Date(),
+        },
+        tx
+      );
+      await repo.consumePendingSignup(pending.id, tx);
+      return created;
+    });
+  } catch (err) {
+    // Someone else confirmed this address between register and now - two people
+    // are allowed to hold a pending signup for one email (PRD EC-A1). We do not
+    // SELECT first: both requests would pass that check. The unique index is the
+    // only atomic judge, so we insert and translate its complaint.
+    if (repo.isUniqueViolation(err, "email")) {
+      throw AppError.conflict(ErrorCodes.EMAIL_ALREADY_EXISTS, "An account with this email already exists.");
+    }
+    throw err;
+  }
+
+  const refreshToken = await startSession(user.id, userAgent);
+  return authPayload(user, refreshToken);
 }
 
 // --- Step 19: resend verification -----------------------------------------
 
-export async function resendVerification(user: User): Promise<void> {
-  if (user.emailVerifiedAt) return; // nothing to do; not an error
+/**
+ * Sends a fresh code - or quietly does nothing - and says the same thing either
+ * way. Unlike the old version this endpoint cannot require a Bearer token,
+ * because the caller has no account yet, so it is public and must not become an
+ * oracle for "is a signup waiting for this address?".
+ *
+ * Every `return` here produces a byte-identical response, INCLUDING the
+ * rate-limited one. The cost is that a resend inside the one-minute window looks
+ * like success and sends nothing, so the client must show the usual countdown on
+ * the button rather than relying on a 429 to tell it to wait.
+ */
+export async function resendVerificationOtp(email: string): Promise<void> {
+  const pending = await repo.findLatestPendingSignup(email);
+  if (!pending) return;
 
-  const now = new Date();
-
-  // BR-AUTH-6: at most 1 per minute and 5 per day. The token rows already carry
-  // createdAt, so counting them is the whole rate limiter - no Redis needed.
-  const lastMinute = await repo.countVerificationTokensSince(user.id, new Date(now.getTime() - MINUTE_MS));
-  if (lastMinute > 0) throw AppError.rateLimited("Please wait a minute before requesting another email.");
-
-  const lastDay = await repo.countVerificationTokensSince(user.id, new Date(now.getTime() - DAY_MS));
-  if (lastDay >= 5) throw AppError.rateLimited("Too many requests today. Please try again tomorrow.");
-
-  const token = generateOpaqueToken();
-  await repo.issueVerificationToken(user.id, hashToken(token), fromNow(VERIFICATION_TTL_MS, now));
-  sendEmailInBackground(mailer.send(verificationEmail(user.email, token)), "verification-resend");
+  await issueSignupOtp(
+    {
+      email: pending.email,
+      firstName: pending.firstName,
+      lastName: pending.lastName,
+      // Reused, never re-derived: the plaintext password was never stored and
+      // the caller does not send it again.
+      passwordHash: pending.passwordHash,
+    },
+    "verification-resend",
+    () => {} // rate-limited: send nothing, say the same thing
+  );
 }
 
 // --- Step 20: forgot password ---------------------------------------------

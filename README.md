@@ -3,11 +3,11 @@
 > *"Who owes whom?"* — an expense-sharing API. Split a bill, track who owes what,
 > settle up.
 
-Express + TypeScript REST API with a complete authentication system: sessions
-with rotating refresh tokens, email verification, and password reset by one-time
-code.
+Express + TypeScript REST API with a complete authentication system: a two-step
+signup that confirms the email with a 6-digit code before the account exists,
+sessions with rotating refresh tokens, and password reset by one-time code.
 
-**Status:** authentication complete and tested (37 tests). Groups, expenses and
+**Status:** authentication complete and tested (41 tests). Groups, expenses and
 balances are next.
 
 ---
@@ -78,7 +78,7 @@ curl http://localhost:4000/health
 | `REFRESH_TOKEN_SECRET` | 32+ random bytes | |
 | `ACCESS_TOKEN_TTL` | `15m` | |
 | `REFRESH_TOKEN_TTL_DAYS` | `30` | |
-| `APP_BASE_URL` | `http://localhost:4000` | Used in verification links |
+| `APP_BASE_URL` | `http://localhost:4000` | The API's own public URL |
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated. Never `*` |
 | `MAIL_DRIVER` | `console` | `console` prints to the terminal; `resend` really sends |
 | `MAIL_FROM` | `Oweo <onboarding@resend.dev>` | |
@@ -98,23 +98,41 @@ Base path `/api/v1`. Success responses are `{ "data": ... }`, failures are
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/auth/register` | — | Create an account, returns both tokens |
+| `POST` | `/auth/register` | — | Step 1 of signup: email a 6-digit code (`202`) |
+| `POST` | `/auth/verify-email` | — | Step 2: confirm the code, **create the account**, return both tokens (`201`) |
+| `POST` | `/auth/verify-email/resend` | — | New code (rate limited, always answers `200`) |
 | `POST` | `/auth/login` | — | Returns both tokens |
 | `GET` | `/auth/me` | Bearer | Current user |
 | `POST` | `/auth/refresh` | — | Exchange a refresh token for a new pair |
 | `POST` | `/auth/logout` | Bearer | Revoke this device's session (`204`) |
-| `POST` | `/auth/verify-email` | — | Consume the emailed token |
-| `POST` | `/auth/verify-email/resend` | Bearer | New verification email (rate limited) |
 | `POST` | `/auth/forgot-password` | — | Email a 6-digit code |
 | `POST` | `/auth/reset-password` | — | Verify the code and set a new password |
 | `GET` | `/health` | — | Liveness plus a database check |
 
-Example:
+### Signup is two requests
+
+The account does not exist until the emailed code is confirmed. Registering
+writes a `PendingSignup` row — the hashed password and the hashed code — and
+nothing else, so an abandoned signup leaves no junk `User` row behind and does
+not reserve the address.
 
 ```bash
+# 1. Details screen -> 202, a code is emailed
 curl -X POST http://localhost:4000/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{"firstName":"Aarav","lastName":"Sharma","email":"aarav@example.com","password":"correct-horse-battery"}'
+```
+
+```jsonc
+{ "data": { "email": "aarav@example.com",
+            "message": "We've sent a 6-digit code to your email." } }
+```
+
+```bash
+# 2. Code screen -> 201, the account now exists and you are signed in
+curl -X POST http://localhost:4000/api/v1/auth/verify-email \
+  -H "Content-Type: application/json" \
+  -d '{"email":"aarav@example.com","otp":"483920"}'
 ```
 
 ```jsonc
@@ -122,9 +140,21 @@ curl -X POST http://localhost:4000/api/v1/auth/register \
     "accessToken":  "eyJhbGciOiJIUzI1NiIs...",   // JWT, 15 minutes
     "refreshToken": "nuR4gsX_6Jgjx30R1ILA...",   // opaque, 30 days
     "user": { "id": "6de3f3f4-...", "firstName": "Aarav", "lastName": "Sharma",
-              "email": "aarav@example.com", "emailVerified": false,
+              "email": "aarav@example.com", "emailVerified": true,
               "friendCode": "XK8MA95" } } }
 ```
+
+Two consequences worth knowing before you build the screen:
+
+- **Two people may hold a pending signup for one address.** Nothing claims the
+  email until a code is confirmed. Whoever confirms first gets the account; the
+  other is told `EMAIL_ALREADY_EXISTS` at step 2, decided by the unique index
+  rather than by a check that could race.
+- **`/verify-email/resend` always answers `200`, even when rate-limited.** It is
+  a public endpoint — the caller has no account yet, so it cannot require a
+  token — and a `429` there would reveal which addresses are mid-signup. Show the
+  usual 60-second countdown on the Resend button; do not wait for the API to say
+  no.
 
 ---
 
@@ -154,10 +184,19 @@ a wrong password, including timing: the unknown-email path still performs a full
 argon2 verification against a dummy hash. `/forgot-password` returns the same
 `200` for verified, unverified, rate-limited and unknown addresses.
 
-**Reset codes** — six digits is only a million combinations, so it is safe only
-because three limits apply together: five attempts, ten-minute expiry, and three
-requests per hour. Codes are hashed at rest and always looked up scoped to the
-user. Completing a reset revokes every session on every device.
+**Six-digit codes** — used for both signup and password reset. A million
+combinations is nothing on its own, so a code is safe only because three limits
+apply together: five attempts, five-minute expiry, and one use. Reset adds three
+requests per hour; signup adds one per minute and five per day per address.
+Codes are hashed at rest and always looked up scoped to one user or one email —
+never "does any row hold this hash?", which would let one person's code unlock
+another person's account. Completing a reset revokes every session on every
+device.
+
+**Confirming a code is not idempotent** — replaying a spent signup code returns
+`OTP_INVALID`, not tokens. The tempting alternative ("this address is already
+verified, so sign them in") would turn knowledge of an email address into a
+login.
 
 **Derived state, not stored state** — there is no `AccountStatus` column. Locked
 and verified are computed from two timestamps, so no row can drift out of date
@@ -211,7 +250,7 @@ docker compose up -d
 npm test
 ```
 
-37 tests, two layers:
+41 tests, two layers:
 
 - `src/shared/crypto/crypto.test.ts` — hashing, tokens, friend codes. No database.
 - `src/modules/auth/auth.test.ts` — all nine endpoints against a real Postgres
@@ -226,7 +265,7 @@ conditional update that makes token rotation safe.
 ## Roadmap
 
 - [x] Project setup, config, error handling, logging
-- [x] Auth: register, login, sessions, verification, password reset
+- [x] Auth: two-step signup by email code, login, sessions, password reset
 - [ ] Profile, friend codes, friend connections, QR
 - [ ] Groups and membership
 - [ ] Balance engine — split arithmetic and pairwise balances, tested before any

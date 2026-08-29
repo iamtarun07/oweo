@@ -58,15 +58,46 @@ async function waitForEmail(count: number) {
   return last;
 }
 
-async function register(body = newUser()) {
+/** Pulls the 6-digit code out of an email. Both templates put it in the text. */
+function otpFromEmail(text: string) {
+  const match = /\b(\d{6})\b/.exec(text);
+  if (!match?.[1]) throw new Error(`no OTP in email: ${text}`);
+  return match[1];
+}
+
+/**
+ * Half a signup: the PendingSignup row and the emailed code, no account yet.
+ *
+ * The email count is captured BEFORE the request. waitForEmail returns the last
+ * message in the array, so a test that has already sent one would otherwise read
+ * a stale code the moment this is called twice.
+ */
+async function startSignup(body = newUser()) {
+  const target = sentEmails.length + 1;
   const res = await request(app).post(`${BASE}/register`).send(body);
+  expect(res.status).toBe(202);
+  return { res, body, otp: otpFromEmail((await waitForEmail(target)).text) };
+}
+
+/**
+ * The whole signup. Tokens come from /verify-email now - registering on its own
+ * creates nothing and hands back no credentials - so any test that needs a real
+ * account goes through here.
+ */
+async function signUp(body = newUser()) {
+  const { otp } = await startSignup(body);
+  const res = await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp });
   expect(res.status).toBe(201);
   return { res, body, tokens: res.body.data as { accessToken: string; refreshToken: string } };
 }
 
-/** Marks a user verified directly - faster than going through the email flow. */
-function markVerified(email: string) {
-  return prisma.user.update({ where: { email }, data: { emailVerifiedAt: new Date() } });
+/**
+ * Every account is verified the moment it is created, so an unverified one can
+ * only be built by hand. Still worth testing: the column stays, and the rules
+ * that read it (forgot-password) must keep working.
+ */
+function markUnverified(email: string) {
+  return prisma.user.update({ where: { email }, data: { emailVerifiedAt: null } });
 }
 
 beforeAll(async () => {
@@ -74,8 +105,10 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  // Sessions, tokens and OTPs are removed by the cascade on User.
+  // Sessions and reset OTPs are removed by the cascade on User. Pending signups
+  // are not: they point at no user by design, so they need their own sweep.
   await prisma.user.deleteMany();
+  await prisma.pendingSignup.deleteMany();
   sentEmails.length = 0;
 });
 
@@ -86,27 +119,34 @@ afterAll(async () => {
 // --- Registration (AC-A1, A2, A3, A5, EC-A1) --------------------------------
 
 describe("POST /register", () => {
-  it("creates an unverified account with tokens and a friend code - AC-A1", async () => {
-    const { res, body } = await register();
+  it("creates no account and issues no tokens, only a code - AC-A1", async () => {
+    const { res, body, otp } = await startSignup();
 
-    expect(res.body.data.user).toMatchObject({ email: body.email, emailVerified: false });
-    expect(res.body.data.user.friendCode).toHaveLength(7);
-    expect(res.body.data.accessToken).toBeTruthy();
-    expect(res.body.data.refreshToken).toBeTruthy();
+    expect(res.status).toBe(202); // accepted, not created
+    expect(res.body.data).toMatchObject({ email: body.email });
+    expect(res.body.data.accessToken).toBeUndefined();
+    expect(res.body.data.refreshToken).toBeUndefined();
 
     // Nothing secret may ever appear in a response.
     expect(JSON.stringify(res.body)).not.toContain("passwordHash");
-    expect(JSON.stringify(res.body)).not.toContain("failedLoginAttempts");
+    expect(JSON.stringify(res.body)).not.toContain(PASSWORD);
 
-    const user = await prisma.user.findUniqueOrThrow({ where: { email: body.email } });
-    expect(user.passwordHash).not.toContain(PASSWORD);
-    expect(user.emailVerifiedAt).toBeNull();
-    expect(await prisma.session.count({ where: { userId: user.id } })).toBe(1);
-    expect(await prisma.emailVerificationToken.count({ where: { userId: user.id } })).toBe(1);
+    // The account does not exist yet - only the pending row does.
+    expect(await prisma.user.count({ where: { email: body.email } })).toBe(0);
+    const pending = await prisma.pendingSignup.findFirstOrThrow({ where: { email: body.email } });
+    expect(pending.passwordHash).not.toContain(PASSWORD);
+    expect(pending.otpHash).not.toContain(otp); // the code itself is never stored
   });
 
-  it("rejects a duplicate email in ANY letter case - AC-A2", async () => {
-    const { body } = await register();
+  it("emails a 6-digit code, never a link - AC-A1", async () => {
+    const { otp } = await startSignup();
+
+    expect(otp).toMatch(/^\d{6}$/);
+    expect(sentEmails[0]?.text).not.toMatch(/https?:\/\//);
+  });
+
+  it("rejects a duplicate email in ANY letter case, once verified - AC-A2", async () => {
+    const { body } = await signUp();
 
     const same = await request(app).post(`${BASE}/register`).send(body);
     expect(same.status).toBe(409);
@@ -116,6 +156,15 @@ describe("POST /register", () => {
       .post(`${BASE}/register`)
       .send({ ...body, email: body.email.toUpperCase() });
     expect(upper.status).toBe(409);
+  });
+
+  it("rate-limits repeat signups for one address to 1 per minute - BR-AUTH-6", async () => {
+    const { body } = await startSignup();
+
+    const again = await request(app).post(`${BASE}/register`).send(body);
+    expect(again.status).toBe(429);
+    expect(again.body.error.code).toBe("RATE_LIMITED");
+    expect(sentEmails).toHaveLength(1); // no second code went out
   });
 
   it("reports every bad field in one response - VR-U-8", async () => {
@@ -142,19 +191,27 @@ describe("POST /register", () => {
     const broken = vi.spyOn(mail.mailer, "send").mockRejectedValueOnce(new Error("mail provider is down"));
 
     const res = await request(app).post(`${BASE}/register`).send(newUser());
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(202);
 
     broken.mockRestore();
   });
 
-  it("creates exactly one account when two identical registrations race - EC-A1", async () => {
-    const body = newUser();
+  it("creates exactly one account when the same code is confirmed twice at once - EC-A1", async () => {
+    // The collision moved from register to verify: that is where the INSERT is.
+    // A double-tapped Submit sends both requests before either has consumed the
+    // row, so both reach the insert and only the unique index can separate them.
+    const { body, otp } = await startSignup();
+
     const results = await Promise.all([
-      request(app).post(`${BASE}/register`).send(body),
-      request(app).post(`${BASE}/register`).send(body),
+      request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp }),
+      request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp }),
     ]);
 
-    expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+    // Exactly one caller is told the account was created. The loser gets 409 if
+    // both inserts raced, or 400 if the row was already consumed by the time it
+    // looked - which one depends on interleaving, so only the counts are asserted.
+    expect(results.filter((r) => r.status === 201)).toHaveLength(1);
+    expect(results.filter((r) => r.status >= 400)).toHaveLength(1);
     expect(await prisma.user.count({ where: { email: body.email } })).toBe(1);
   });
 });
@@ -163,7 +220,7 @@ describe("POST /register", () => {
 
 describe("POST /login", () => {
   it("returns tokens for correct credentials - AC-A6", async () => {
-    const { body } = await register();
+    const { body } = await signUp();
 
     const res = await request(app).post(`${BASE}/login`).send({ email: body.email, password: PASSWORD });
     expect(res.status).toBe(200);
@@ -171,7 +228,7 @@ describe("POST /login", () => {
   });
 
   it("answers identically for a wrong password and an unknown email - AC-A7", async () => {
-    const { body } = await register();
+    const { body } = await signUp();
 
     const wrong = await request(app).post(`${BASE}/login`).send({ email: body.email, password: "wrong-password-x" });
     const unknown = await request(app)
@@ -185,7 +242,7 @@ describe("POST /login", () => {
   });
 
   it("locks the account after 5 failures and reports it on the next attempt - AC-A8", async () => {
-    const { body } = await register();
+    const { body } = await signUp();
 
     for (let i = 0; i < 5; i++) {
       const res = await request(app).post(`${BASE}/login`).send({ email: body.email, password: "wrong-password-x" });
@@ -200,15 +257,17 @@ describe("POST /login", () => {
   });
 
   it("does not trim the password - EC-A11", async () => {
+    // The trailing space has to survive register AND the PendingSignup round
+    // trip, so this goes through the whole signup rather than just step one.
     const body = { ...newUser(), password: `${PASSWORD} ` };
-    await request(app).post(`${BASE}/register`).send(body).expect(201);
+    await signUp(body);
 
     await request(app).post(`${BASE}/login`).send({ email: body.email, password: PASSWORD }).expect(401);
     await request(app).post(`${BASE}/login`).send({ email: body.email, password: `${PASSWORD} ` }).expect(200);
   });
 
   it("keeps both sessions alive when the same user logs in twice - EC-A8", async () => {
-    const { body, tokens } = await register();
+    const { body, tokens } = await signUp();
 
     const second = await request(app).post(`${BASE}/login`).send({ email: body.email, password: PASSWORD });
 
@@ -221,7 +280,7 @@ describe("POST /login", () => {
 
 describe("GET /me", () => {
   it("returns the public user for a valid access token", async () => {
-    const { body, tokens } = await register();
+    const { body, tokens } = await signUp();
 
     const res = await request(app).get(`${BASE}/me`).set("Authorization", `Bearer ${tokens.accessToken}`);
     expect(res.status).toBe(200);
@@ -236,8 +295,14 @@ describe("GET /me", () => {
   });
 
   it("lets an UNVERIFIED user through - AR-12", async () => {
-    const { tokens } = await register();
+    // Signup cannot produce one any more, so the state is forced by hand. The
+    // rule still matters: requireAuth must gate on "is this a real session",
+    // never on emailVerified, or a future email change would lock people out.
+    const { body, tokens } = await signUp();
+    await markUnverified(body.email);
+
     const res = await request(app).get(`${BASE}/me`).set("Authorization", `Bearer ${tokens.accessToken}`);
+    expect(res.status).toBe(200);
     expect(res.body.data.user.emailVerified).toBe(false);
   });
 });
@@ -246,7 +311,7 @@ describe("GET /me", () => {
 
 describe("POST /refresh", () => {
   it("rotates: the new token works and the old one stops working", async () => {
-    const { tokens } = await register();
+    const { tokens } = await signUp();
 
     const first = await request(app).post(`${BASE}/refresh`).send({ refreshToken: tokens.refreshToken });
     expect(first.status).toBe(200);
@@ -256,7 +321,7 @@ describe("POST /refresh", () => {
   });
 
   it("replaying a rotated token kills the whole family - AC-A22", async () => {
-    const { tokens } = await register();
+    const { tokens } = await signUp();
 
     const rotated = await request(app).post(`${BASE}/refresh`).send({ refreshToken: tokens.refreshToken });
     const goodToken = rotated.body.data.refreshToken;
@@ -280,7 +345,7 @@ describe("POST /refresh", () => {
 
 describe("POST /logout", () => {
   it("revokes only this device's family - AC-C12", async () => {
-    const { body, tokens } = await register();
+    const { body, tokens } = await signUp();
     const otherDevice = await request(app).post(`${BASE}/login`).send({ email: body.email, password: PASSWORD });
 
     await request(app)
@@ -297,7 +362,7 @@ describe("POST /logout", () => {
   });
 
   it("is idempotent - logging out twice is still a success", async () => {
-    const { tokens } = await register();
+    const { tokens } = await signUp();
     const logout = () =>
       request(app)
         .post(`${BASE}/logout`)
@@ -311,86 +376,103 @@ describe("POST /logout", () => {
 
 // --- Email verification (AC-A10...A13, EC-A14) ------------------------------
 
-/** Pulls the token out of the verification link in the emailed text. */
-function tokenFromEmail(text: string) {
-  const match = /token=([\w-]+)/.exec(text);
-  if (!match?.[1]) throw new Error(`no token in email: ${text}`);
-  return match[1];
-}
-
 describe("POST /verify-email", () => {
-  it("verifies once, and a second use is still a success - AC-A10, AC-A12", async () => {
-    const { body } = await register();
-    const token = tokenFromEmail((await waitForEmail(1)).text);
+  it("creates the verified account and returns the tokens - AC-A10", async () => {
+    const { body, otp } = await startSignup();
 
-    await request(app).post(`${BASE}/verify-email`).send({ token }).expect(200);
+    const res = await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.user).toMatchObject({ email: body.email, emailVerified: true });
+    expect(res.body.data.user.friendCode).toHaveLength(7);
+    expect(res.body.data.accessToken).toBeTruthy();
+    expect(res.body.data.refreshToken).toBeTruthy();
+    expect(JSON.stringify(res.body)).not.toContain("passwordHash");
 
     const user = await prisma.user.findUniqueOrThrow({ where: { email: body.email } });
     expect(user.emailVerifiedAt).not.toBeNull();
+    expect(await prisma.session.count({ where: { userId: user.id } })).toBe(1);
 
-    // Same link clicked again (people do this) - the goal is met, so no error.
-    await request(app).post(`${BASE}/verify-email`).send({ token }).expect(200);
+    // The code is spent, and the account it made is the only thing left.
+    const pending = await prisma.pendingSignup.findFirstOrThrow({ where: { email: body.email } });
+    expect(pending.consumedAt).not.toBeNull();
   });
 
-  it("refuses an expired token - AC-A11", async () => {
-    await register();
-    const token = tokenFromEmail((await waitForEmail(1)).text);
+  it("refuses to hand out tokens for an already-used code - AC-A12", async () => {
+    const { body, otp } = await startSignup();
+    await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp }).expect(201);
 
-    await prisma.emailVerificationToken.updateMany({ data: { expiresAt: new Date(Date.now() - 1000) } });
-
-    const res = await request(app).post(`${BASE}/verify-email`).send({ token });
-    expect(res.status).toBe(401);
-    expect(res.body.error.code).toBe("TOKEN_EXPIRED");
+    // NOT idempotent on purpose: replaying a spent code must not sign anyone in,
+    // or knowing an email address alone would be enough to get tokens.
+    const again = await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp });
+    expect(again.status).toBe(400);
+    expect(again.body.error.code).toBe("OTP_INVALID");
   });
 
-  it("issuing a new token kills the previous one - EC-A14", async () => {
-    const { tokens } = await register();
-    const oldToken = tokenFromEmail((await waitForEmail(1)).text);
+  it("refuses an expired code - AC-A11", async () => {
+    const { body, otp } = await startSignup();
+
+    await prisma.pendingSignup.updateMany({ data: { expiresAt: new Date(Date.now() - 1000) } });
+
+    const res = await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("OTP_EXPIRED");
+    expect(await prisma.user.count({ where: { email: body.email } })).toBe(0);
+  });
+
+  it("kills the code after 5 wrong guesses - BR-AUTH-4", async () => {
+    const { body, otp } = await startSignup();
+    const wrong = otp === "000000" ? "111111" : "000000";
+
+    for (let i = 0; i < 5; i++) {
+      const res = await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp: wrong });
+      expect(res.body.error.code).toBe("OTP_INVALID");
+    }
+
+    // Sixth try, this time with the RIGHT code: the code is spent regardless.
+    const res = await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp });
+    expect(res.body.error.code).toBe("OTP_ATTEMPTS_EXCEEDED");
+    expect(await prisma.user.count({ where: { email: body.email } })).toBe(0);
+  });
+
+  it("issuing a new code kills the previous one - EC-A14", async () => {
+    const { body, otp: oldOtp } = await startSignup();
 
     // Backdate the first request so the 1-per-minute limit does not block us.
-    await prisma.emailVerificationToken.updateMany({
-      data: { createdAt: new Date(Date.now() - 5 * 60 * 1000) },
-    });
+    await prisma.pendingSignup.updateMany({ data: { createdAt: new Date(Date.now() - 5 * 60 * 1000) } });
 
-    await request(app)
-      .post(`${BASE}/verify-email/resend`)
-      .set("Authorization", `Bearer ${tokens.accessToken}`)
-      .expect(200);
+    await request(app).post(`${BASE}/verify-email/resend`).send({ email: body.email }).expect(200);
+    const newOtp = otpFromEmail((await waitForEmail(2)).text);
+    expect(newOtp).not.toBe(oldOtp);
 
-    const newToken = tokenFromEmail((await waitForEmail(2)).text);
-    expect(newToken).not.toBe(oldToken);
-
-    await request(app).post(`${BASE}/verify-email`).send({ token: oldToken }).expect(401);
-    await request(app).post(`${BASE}/verify-email`).send({ token: newToken }).expect(200);
+    const stale = await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp: oldOtp });
+    expect(stale.status).toBe(400);
+    await request(app).post(`${BASE}/verify-email`).send({ email: body.email, otp: newOtp }).expect(201);
   });
 
-  it("rate-limits resend to 1 per minute - AC-A13", async () => {
-    const { tokens } = await register();
-    await waitForEmail(1);
+  it("resend says the same thing whether or not a signup is waiting - AC-A13", async () => {
+    const { body } = await startSignup();
 
-    const res = await request(app)
+    // Rate-limited (inside the minute), and an address nobody has used. Both
+    // must be indistinguishable from a real send, or this endpoint becomes a
+    // "who is signing up?" oracle.
+    const limited = await request(app).post(`${BASE}/verify-email/resend`).send({ email: body.email });
+    const unknown = await request(app)
       .post(`${BASE}/verify-email/resend`)
-      .set("Authorization", `Bearer ${tokens.accessToken}`);
+      .send({ email: "nobody@example.com" });
 
-    expect(res.status).toBe(429);
-    expect(res.body.error.code).toBe("RATE_LIMITED");
-    expect(sentEmails).toHaveLength(1); // no second email went out
+    expect(limited.status).toBe(200);
+    expect(limited.body).toEqual(unknown.body);
+
+    await new Promise((r) => setTimeout(r, 100)); // give a second email a chance
+    expect(sentEmails).toHaveLength(1); // neither call actually sent one
   });
 });
 
 // --- Password reset (AC-A15...A19, AC-A9) -----------------------------------
 
-/** Pulls the 6-digit code out of the reset email. */
-function otpFromEmail(text: string) {
-  const match = /\b(\d{6})\b/.exec(text);
-  if (!match?.[1]) throw new Error(`no OTP in email: ${text}`);
-  return match[1];
-}
-
 async function verifiedUserWithOtp() {
-  const { body } = await register();
-  await markVerified(body.email);
-  await waitForEmail(1);
+  const { body } = await signUp();
 
   await request(app).post(`${BASE}/forgot-password`).send({ email: body.email }).expect(200);
   const otp = otpFromEmail((await waitForEmail(2)).text);
@@ -399,10 +481,9 @@ async function verifiedUserWithOtp() {
 
 describe("POST /forgot-password", () => {
   it("says the same thing for verified, unverified and unknown emails - AC-A15, A16, BR-AUTH-10", async () => {
-    const { body: verified } = await register();
-    await markVerified(verified.email);
-    const { body: unverified } = await register();
-    await waitForEmail(2);
+    const { body: verified } = await signUp();
+    const { body: unverified } = await signUp();
+    await markUnverified(unverified.email);
     sentEmails.length = 0;
 
     const a = await request(app).post(`${BASE}/forgot-password`).send({ email: verified.email });
@@ -420,9 +501,7 @@ describe("POST /forgot-password", () => {
   });
 
   it("stops sending after 3 requests in an hour, same message - AC-A19", async () => {
-    const { body } = await register();
-    await markVerified(body.email);
-    await waitForEmail(1);
+    const { body } = await signUp();
     sentEmails.length = 0;
 
     for (let i = 0; i < 4; i++) {

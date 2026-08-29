@@ -32,7 +32,11 @@ export const refreshSchema = z.object({ refreshToken: z.string().min(1) }).stric
 
 export const logoutSchema = refreshSchema;
 
-export const verifyEmailSchema = z.object({ token: z.string().min(1) }).strict();
+// The email travels with the code because there is no session to infer it from
+// - the account does not exist until this request succeeds.
+export const verifyEmailSchema = z.object({ email: emailSchema, otp: otpSchema }).strict();
+
+export const resendVerificationSchema = z.object({ email: emailSchema }).strict();
 
 export const forgotPasswordSchema = z.object({ email: emailSchema }).strict();
 
@@ -46,4 +50,5 @@ export const resetPasswordSchema = z
 
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type LoginInput = z.infer<typeof loginSchema>;
+export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>;
 export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
