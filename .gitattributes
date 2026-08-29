@@ -1,0 +1,12 @@
+# Store everything with LF in the repository, check out native on Windows.
+# Without this, a file saved on Windows and one saved on macOS show up as a
+# whole-file diff even when nothing really changed.
+* text=auto eol=lf
+
+# Never touch these — they are not text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary

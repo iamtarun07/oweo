@@ -1,0 +1,37 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# environment — secrets live here, never in git.
+# .env.example IS committed: it is the template, with empty values.
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+
+# tests
+coverage/
+.vitest/
+
+# editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS noise
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# generated Prisma client (run `npx prisma generate` to rebuild it)
+**/src/generated/
+
+# private notes and specs - not published
+docs/

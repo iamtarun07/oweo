@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+
+    environment:
+      POSTGRES_USER: oweo
+      POSTGRES_PASSWORD: oweo
+      POSTGRES_DB: oweo_dev
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oweo -d oweo_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis will be added in Phase 9.
+  # redis:
+  #   image: redis:7-alpine
+
+volumes:
+  postgres_data:

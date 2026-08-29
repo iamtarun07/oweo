@@ -1,0 +1,6 @@
+{
+  // Used by `npm run build` only: same settings, minus the tests, so dist/
+  // ships the app and nothing else. `npm run typecheck` still checks tests.
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+}

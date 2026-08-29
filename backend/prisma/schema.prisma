@@ -1,0 +1,103 @@
+// Models are defined in Part 2 of the guide.
+// Connection URL lives in prisma.config.ts (CLI) and the driver adapter (runtime).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// A person with an account.
+model User {
+  // A UUID, not an auto-increment integer: sequential ids let anyone guess
+  // other users' ids and reveal how many users exist (PRD SEC-13).
+  id           String  @id @default(uuid())
+  email        String  @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  friendCode   String  @unique
+
+  // Null means "not verified yet". One nullable timestamp replaces a status
+  // enum AND records when it happened.
+  emailVerifiedAt DateTime?
+
+  // Brute-force defence, per account (PRD BR-AUTH-3/4).
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  lastFailedLoginAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions           Session[]
+  verificationTokens EmailVerificationToken[]
+  passwordResetOtps  PasswordResetOtp[]
+}
+
+/// One row per refresh token. Rotating a token adds a row; it never edits one.
+model Session {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Same value for every rotation of one login. Stealing a token and replaying
+  // it kills the whole family, which is how theft is contained (BR-AUTH-20).
+  familyId String
+
+  // SHA-256 of the token. If this database ever leaks, the hashes are useless
+  // to the attacker — same reasoning as passwords.
+  tokenHash String @unique
+
+  expiresAt DateTime
+  rotatedAt DateTime? // set when exchanged for a newer token
+  revokedAt DateTime? // set on logout, password reset, or reuse detection
+  replacedById String? // makes the chain walkable when debugging
+  userAgent    String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+/// Single-use link token emailed after registration. Valid 24h (BR-AUTH-5).
+model EmailVerificationToken {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  consumedAt DateTime? // null = still usable
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+/// 6-digit password-reset code. Valid 10 minutes, 5 guesses.
+model PasswordResetOtp {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // NOT @unique: only a million codes exist, so two users sharing one is normal.
+  // Lookups are always scoped by userId for the same reason.
+  otpHash String
+
+  expiresAt    DateTime
+  attemptCount Int       @default(0)
+  consumedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// LoginAttempt (per-IP limiting, PRD §29.5) is deliberately NOT here.
+// It needs keys that expire by themselves — that is Redis' job, in Phase 9.
+// A Postgres table would grow forever and need a cleanup job we would delete.
